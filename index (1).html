@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tamil Nadu — Water Source Density</title>
+<!--
+  SETUP: browsers block fetch() on file://. Put this file next to data.csv, run
+  `python -m http.server` in that folder, then open http://localhost:8000
+-->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.6.1/papaparse.min.js"></script>
+
+<style>
+  html, body, #map { height:100%; margin:0; }
+  #status{ position:absolute; inset:0; z-index:2000; display:flex; align-items:center; justify-content:center;
+    background:rgba(255,255,255,0.92); font:15px/1.5 Arial,Helvetica,sans-serif; color:#333; text-align:center; padding:30px; box-sizing:border-box; }
+  #status.hidden{ display:none; }
+  .info-box{ background:#fff; padding:10px 12px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.3); font:13px/1.4 Arial,Helvetica,sans-serif; color:#222; }
+  .legend-row{ display:flex; align-items:center; gap:7px; margin:4px 0; }
+  .legend-swatch{ width:14px; height:14px; border-radius:3px; flex:0 0 auto; }
+
+  /* cluster bubbles (size + color are set inline from the data) */
+  .tn-dot{ width:100%; height:100%; box-sizing:border-box; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    border:2px solid rgba(255,255,255,.9); box-shadow:0 1px 5px rgba(0,0,0,.45); opacity:.92; font:bold 12px/1 Arial,Helvetica,sans-serif; }
+
+  /* legend pieces */
+  .ramp{ height:10px; border-radius:5px; margin:5px 0 2px; border:1px solid rgba(0,0,0,.2); }
+  .ramp-labels{ display:flex; justify-content:space-between; font-size:11px; opacity:.75; }
+  .size-row{ display:flex; align-items:flex-end; gap:12px; margin:6px 0 2px; }
+  .size-item{ text-align:center; font-size:11px; }
+  .size-item i{ display:block; margin:0 auto 2px; border-radius:50%; background:#c9c9c9; border:1px solid #888; box-sizing:border-box; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="status">Loading data.csv…</div>
+
+<script>
+// ============================================================
+// CONFIG — the knobs you're most likely to touch.
+// ============================================================
+const DATA_URL        = 'data.csv';               // path to your CSV
+const LAT_COL         = 'latitude';                // column name for latitude
+const LON_COL         = 'longitude';               // column name for longitude
+const ENCROACHED_COL  = 'waterbody_encroached';    // column name for Yes/No
+
+const POINTS_FROM_ZOOM  = 13;   // at this zoom and closer, clusters give way to individual points
+const CLUSTER_RADIUS_PX = 60;   // sources closer than this on screen merge into one cluster
+const REF_LAT = 10.8;           // TN's approx central latitude (turns screen pixels into km)
+
+// Bounding Box
+const TN_BOUNDS  = [[8.0, 76.2], [13.6, 80.4]];
+const BOUNDS_PAD = 0.03;                           // extra margin past the box (3%)
+
+// Same palette as before. A cluster's color runs unenc -> both -> enc with its % encroached.
+const COLORS = { unenc:'#3288bd', both:'#fee08b', enc:'#d53e4f' };
+
+const statusEl = document.getElementById('status');
+function setStatus(msg, isError){
+  statusEl.textContent = msg;
+  statusEl.classList.remove('hidden');
+  statusEl.style.color = isError ? '#b91c1c' : '#333';
+}
+
+// ============================================================
+// MAP — locked to a Tamil Nadu bounding box (unchanged).
+// ============================================================
+const tnBounds = L.latLngBounds(TN_BOUNDS);
+const map = L.map('map', {
+  preferCanvas: true,
+  zoomSnap: 0.25,
+  maxBounds: tnBounds.pad(BOUNDS_PAD),
+  maxBoundsViscosity: 1.0
+});
+map.fitBounds(tnBounds);
+
+function lockZoomToBounds(){ map.setMinZoom(map.getBoundsZoom(tnBounds)); }
+lockZoomToBounds();
+map.on('resize', lockZoomToBounds);
+
+// For a paler basemap (colors pop more), swap the URL below for:
+// 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: 'abcd', maxZoom: 19
+}).addTo(map);
+
+// ============================================================
+// COLOR + SCALE HELPERS
+// ============================================================
+const hex = h => [1,3,5].map(i => parseInt(h.slice(i, i+2), 16));
+const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+const RGB = { u:hex(COLORS.unenc), b:hex(COLORS.both), e:hex(COLORS.enc) };
+
+// t = share of encroached sources (0..1): blue at 0, yellow at 0.5, red at 1.
+const rampColor = t => 'rgb(' + (t < .5 ? mix(RGB.u, RGB.b, t*2) : mix(RGB.b, RGB.e, (t-.5)*2)).join(',') + ')';
+
+// A cluster gathers sources from roughly a circle of CLUSTER_RADIUS_PX. That circle covers
+// less ground at every zoom step, so "sources / km²" is re-derived from the current zoom.
+const catchKm2 = () => Math.PI * Math.pow(CLUSTER_RADIUS_PX * 156.543 * Math.cos(REF_LAT*Math.PI/180) / Math.pow(2, Math.round(map.getZoom())), 2);
+const density  = n => n / catchKm2();
+const fmt      = v => v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v >= .01 ? v.toFixed(2) : v.toPrecision(1);
+const sizePx   = frac => Math.round(28 + 32 * Math.sqrt(Math.min(1, frac)));   // bubble diameter
+
+// The live scale: the biggest cluster on screen. Recomputed after every zoom and pan.
+const scale = { maxN: 2, has: false };
+let mcg, legendEl, timer, lastZ = null;
+
+function stats(cluster){
+  const kids = cluster.getAllChildMarkers();
+  let enc = 0;
+  kids.forEach(m => { enc += m.feature.properties.enc; });
+  return { n: kids.length, enc };
+}
+
+function clusterIcon(cluster){
+  const { n, enc } = stats(cluster), t = enc / n, dark = t > .18 && t < .82;
+  const label = n >= 1000 ? (n/1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : n;
+  const px = sizePx(n / scale.maxN);
+  return L.divIcon({
+    className: 'tn-cluster', iconSize: [px, px],
+    html: '<div class="tn-dot" style="background:' + rampColor(t) + ';color:' + (dark ? '#222' : '#fff') + '">' + label + '</div>'
+  });
+}
+
+function schedule(){ clearTimeout(timer); timer = setTimeout(refreshScale, 120); }
+
+function refreshScale(){
+  lastZ = Math.round(map.getZoom());
+  const list = [];
+  map.eachLayer(l => { if (l instanceof L.MarkerCluster) list.push(l); });
+  const maxN = list.reduce((m, c) => Math.max(m, c.getChildCount()), 2);
+  const changed = maxN !== scale.maxN;
+  scale.has = list.length > 0;
+  scale.maxN = maxN;
+  if (changed) mcg.refreshClusters();     // re-draw bubbles against the new scale
+  updateLegend();
+}
+
+// ============================================================
+// LOAD + PARSE — CSV -> GeoJSON FeatureCollection
+// ============================================================
+fetch(DATA_URL)
+  .then(res => {
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    return res.text();
+  })
+  .then(text => {
+    const parsed = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
+    if(parsed.errors && parsed.errors.length) console.warn('CSV parse warnings:', parsed.errors);
+
+    const rows = parsed.data;
+    if(!rows.length || !(LAT_COL in rows[0])){
+      throw new Error('Column "'+LAT_COL+'" not found — check LAT_COL / LON_COL / ENCROACHED_COL at the top of the script match your CSV headers.');
+    }
+
+    const features = [];
+    rows.forEach(r => {
+      const lat = parseFloat(r[LAT_COL]), lon = parseFloat(r[LON_COL]);
+      if(!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      const raw = String(r[ENCROACHED_COL] || '').trim().toLowerCase();
+      const enc = (raw === 'yes' || raw === 'true' || raw === '1') ? 1 : 0;
+      features.push({ type:'Feature', properties:{ enc }, geometry:{ type:'Point', coordinates:[lon, lat] } });
+    });
+
+    statusEl.classList.add('hidden');
+    buildClusters({ type:'FeatureCollection', features });
+  })
+  .catch(err => {
+    setStatus('Could not load '+DATA_URL+' ('+err.message+'). If you just double-clicked this file, see the SETUP note at the top of the HTML source — you need a local server, not file://.', true);
+    console.error(err);
+  });
+
+// ============================================================
+// CLUSTERS — same pattern as the Leaflet.markercluster GeoJSON example
+// (GeoJSON layer -> markerClusterGroup -> map), with circle markers for the
+// individual points and custom bubbles for the clusters.
+// ============================================================
+function buildClusters(fc){
+  scale.maxN = fc.features.length;        // placeholder until the first refreshScale()
+
+  mcg = L.markerClusterGroup({
+    maxClusterRadius: CLUSTER_RADIUS_PX,
+    disableClusteringAtZoom: POINTS_FROM_ZOOM,   // from this zoom on, every source is its own point
+    spiderfyOnMaxZoom: false,
+    showCoverageOnHover: false,
+    chunkedLoading: true,                        // keeps the page responsive on big CSVs
+    chunkProgress: (done, total) => { if(done === total) schedule(); },
+    iconCreateFunction: clusterIcon
+  });
+  map.addLayer(mcg);
+
+  mcg.addLayer(L.geoJSON(fc, {
+    pointToLayer: (f, ll) => L.circleMarker(ll, {
+      radius:5, weight:1.5, color:'#fff', fillOpacity:.95,
+      fillColor: f.properties.enc ? COLORS.enc : COLORS.unenc
+    })
+  }));
+
+  mcg.on('animationend', schedule);                                              // after every zoom
+  map.on('moveend', () => { if(Math.round(map.getZoom()) === lastZ) schedule(); });   // after every pan
+
+  // One lazy tooltip handler for clusters and points alike.
+  mcg.on('mouseover', e => {
+    const l = e.layer;
+    if(!l) return;
+    let tip;
+    if(l instanceof L.MarkerCluster){
+      const s = stats(l);
+      tip = '<b>'+s.n.toLocaleString()+' sources</b><br>'+Math.round(100*s.enc/s.n)+'% encroached<br>≈ '+fmt(density(s.n))+' per km²';
+    } else {
+      tip = l.feature.properties.enc ? 'Encroached source' : 'Unencroached source';
+    }
+    if(l.getTooltip()) l.setTooltipContent(tip); else l.bindTooltip(tip, { sticky:true });
+    l.openTooltip(e.latlng);
+  });
+
+  addControls(fc.features.length);
+}
+
+// ============================================================
+// LEGEND + TITLE — the legend is redrawn whenever the scale changes
+// ============================================================
+function updateLegend(){
+  if(!legendEl) return;
+  const z = Math.round(map.getZoom()), pts = z >= POINTS_FROM_ZOOM, maxD = density(scale.maxN);
+  let h = '<div style="font-weight:bold;margin-bottom:2px;">Water source density</div>' +
+          '<div style="opacity:.7;margin-bottom:6px;">Zoom '+z+': '+(pts ? 'individual sources' : 'clusters')+'</div>';
+  if(!pts && scale.has){
+    h += 'Cluster color = % encroached' +
+      '<div class="ramp" style="background:linear-gradient(to right,'+COLORS.unenc+','+COLORS.both+','+COLORS.enc+')"></div>' +
+      '<div class="ramp-labels"><span>0%</span><span>50%</span><span>100%</span></div>' +
+      '<div style="margin-top:8px;">Cluster size = sources per km²<br><span style="opacity:.7">rescales as you zoom and pan</span></div>' +
+      '<div class="size-row">' + [1, .25, .05].map(f => {
+        const s = sizePx(f);
+        return '<div class="size-item"><i style="width:'+s+'px;height:'+s+'px"></i>'+fmt(maxD*f)+'</div>';
+      }).join('') + '</div>';
+  }
+  h += '<div class="legend-row" style="margin-top:6px;"><span class="legend-swatch" style="background:'+COLORS.unenc+';border-radius:50%"></span>Unencroached source</div>' +
+       '<div class="legend-row"><span class="legend-swatch" style="background:'+COLORS.enc+';border-radius:50%"></span>Encroached source</div>';
+  legendEl.innerHTML = h;
+}
+
+function addControls(recordCount){
+  const Legend = L.Control.extend({ options:{position:'bottomright'},
+    onAdd: function(){ legendEl = L.DomUtil.create('div','info-box'); return legendEl; }});
+  map.addControl(new Legend());
+
+  const Title = L.Control.extend({ options:{position:'topleft'},
+    onAdd: function(){
+      const div = L.DomUtil.create('div','info-box');
+      div.innerHTML = '<div style="font-weight:bold;">Tamil Nadu — Water Source Density</div>'+
+        '<div style="opacity:.7;">'+recordCount.toLocaleString()+' records, individual points from zoom '+POINTS_FROM_ZOOM+'</div>';
+      return div;
+    }});
+  map.addControl(new Title());
+  updateLegend();
+}
+</script>
+</body>
+</html>

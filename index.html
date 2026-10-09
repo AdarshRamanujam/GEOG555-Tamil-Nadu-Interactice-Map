@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tamil Nadu — Water Source Density</title>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.6.1/papaparse.min.js"></script>
+
+<style>
+  html, body, #map { height:100%; margin:0; }
+  #status{ position:absolute; inset:0; z-index:2000; display:flex; align-items:center; justify-content:center;
+    background:rgba(255,255,255,0.92); font:15px/1.5 Arial,Helvetica,sans-serif; color:#333; text-align:center; padding:30px; box-sizing:border-box; }
+  #status.hidden{ display:none; }
+  .info-box{ background:#fff; padding:10px 12px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.3); font:13px/1.4 Arial,Helvetica,sans-serif; color:#222; }
+  .legend-row{ display:flex; align-items:center; gap:7px; margin:4px 0; }
+  .legend-swatch{ width:14px; height:14px; border-radius:3px; flex:0 0 auto; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="status">Loading data.csv…</div>
+
+<script>
+// ============================================================
+// CONFIG — the knobs you're most likely to touch for a bigger /
+// different dataset.
+// ============================================================
+const DATA_URL        = 'data.csv';               // path to your CSV
+const LAT_COL         = 'latitude';                // column name for latitude
+const LON_COL         = 'longitude';               // column name for longitude
+const ENCROACHED_COL  = 'waterbody_encroached';    // column name for Yes/No
+const GRID_KM         = 1;                         // cell size — spec calls for 1 sq km
+const ORIGIN_LAT = 8.0, ORIGIN_LON = 76.0;         // fixed TN SW corner, so cells stay
+                                                    // aligned no matter how much data you load
+const REF_LAT = 10.8;                              // TN's approx central latitude, used to
+                                                    // convert 1km of longitude into degrees
+
+const statusEl = document.getElementById('status');
+function setStatus(msg, isError){
+  statusEl.textContent = msg;
+  statusEl.classList.remove('hidden');
+  statusEl.style.color = isError ? '#b91c1c' : '#333';
+}
+
+// ============================================================
+// MAP — CARTO Positron tiles (clean/minimal, free, no API key)
+// with Tamil Nadu as the initial focus.
+// ============================================================
+const map = L.map('map', { preferCanvas:true }).fitBounds([[8.0,76.0],[13.6,80.4]]);
+
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: 'abcd', maxZoom: 19
+}).addTo(map);
+
+// ============================================================
+// LOAD + PARSE — swap the fetch URL for wherever your bigger
+// file lives. For very large CSVs (100k+ rows) Papa.parse also
+// accepts {worker:true} to parse off the main thread.
+// ============================================================
+fetch(DATA_URL)
+  .then(res => {
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    return res.text();
+  })
+  .then(text => {
+    const parsed = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
+    if(parsed.errors && parsed.errors.length) console.warn('CSV parse warnings:', parsed.errors);
+
+    const rows = parsed.data;
+    if(!rows.length || !(LAT_COL in rows[0])){
+      throw new Error('Column "'+LAT_COL+'" not found — check LAT_COL / LON_COL / ENCROACHED_COL at the top of the script match your CSV headers.');
+    }
+
+    const DATA = rows.map(r => {
+      const lat = Number(r[LAT_COL]);
+      const lon = Number(r[LON_COL]);
+      const raw = String(r[ENCROACHED_COL] || '').trim().toLowerCase();
+      const enc = (raw === 'yes' || raw === 'true' || raw === '1') ? 1 : 0;
+      return [lat, lon, enc];
+    }).filter(d => Number.isFinite(d[0]) && Number.isFinite(d[1]));
+
+    statusEl.classList.add('hidden');
+    buildGrid(DATA);
+  })
+  .catch(err => {
+    setStatus('Could not load '+DATA_URL+' ('+err.message+'). If you just double-clicked this file, see the SETUP note at the top of the HTML source — you need a local server, not file://.', true);
+    console.error(err);
+  });
+
+// ============================================================
+// GRID — bin points into ~1 sq km cells; classify each cell as
+// blue (unencroached only), green (encroached only), or purple
+// (both — shaded by the share that's encroached).
+// ============================================================
+function buildGrid(DATA){
+  const latStep = GRID_KM / 110.574;
+  const lonStep = GRID_KM / (111.320 * Math.cos(REF_LAT*Math.PI/180));
+
+  const cells = new Map();
+  DATA.forEach(([lat,lon,enc])=>{
+    const row = Math.floor((lat-ORIGIN_LAT)/latStep);
+    const col = Math.floor((lon-ORIGIN_LON)/lonStep);
+    const key = row+'_'+col;
+    let c = cells.get(key);
+    if(!c){ c = {row,col,unenc:0,enc:0}; cells.set(key,c); }
+    if(enc) c.enc++; else c.unenc++;
+  });
+
+  // Normalize each category's intensity against its own busiest cell.
+  let maxBlue=1, maxGreen=1;
+  cells.forEach(c=>{
+    if(c.unenc>0 && c.enc===0) maxBlue = Math.max(maxBlue,c.unenc);
+    if(c.enc>0 && c.unenc===0) maxGreen = Math.max(maxGreen,c.enc);
+  });
+
+  // Render on a blurred canvas pane so neighboring cells blend into
+  // a gradient instead of a hard grid.
+  const gridPane = map.createPane('gridPane');
+  gridPane.style.zIndex = 450;
+  gridPane.style.filter = 'blur(2.5px)';
+  const gridRenderer = L.canvas({ pane:'gridPane' });
+
+  cells.forEach(c=>{
+    const south = ORIGIN_LAT + c.row*latStep, north = south+latStep;
+    const west  = ORIGIN_LON + c.col*lonStep, east  = west+lonStep;
+    let color, opacity, text;
+    if(c.unenc>0 && c.enc===0){
+      color = '#2563eb';
+      opacity = 0.25 + 0.55*(c.unenc/maxBlue);
+      text = c.unenc+' unencroached source'+(c.unenc>1?'s':'')+' / km²';
+    } else if(c.enc>0 && c.unenc===0){
+      color = '#16a34a';
+      opacity = 0.25 + 0.55*(c.enc/maxGreen);
+      text = c.enc+' encroached source'+(c.enc>1?'s':'')+' / km²';
+    } else {
+      const ratio = c.enc/(c.enc+c.unenc);
+      color = '#9333ea';
+      opacity = 0.3 + 0.55*ratio;
+      text = c.enc+' encroached, '+c.unenc+' unencroached — '+Math.round(ratio*100)+'% encroached';
+    }
+    L.rectangle([[south,west],[north,east]], {
+      renderer:gridRenderer, stroke:false, fillColor:color, fillOpacity:opacity
+    }).bindTooltip(text, {sticky:true}).addTo(map);
+  });
+
+  addLegend(DATA.length, cells.size);
+}
+
+// ============================================================
+// LEGEND + TITLE
+// ============================================================
+function addLegend(recordCount, cellCount){
+  const Legend = L.Control.extend({ options:{position:'bottomright'},
+    onAdd: function(){
+      const div = L.DomUtil.create('div','info-box');
+      div.innerHTML =
+        '<div style="font-weight:bold;margin-bottom:4px;">Water source density</div>'+
+        '<div class="legend-row"><span class="legend-swatch" style="background:#2563eb;"></span>Unencroached (≥1/km²)</div>'+
+        '<div class="legend-row"><span class="legend-swatch" style="background:#16a34a;"></span>Encroached (≥1/km²)</div>'+
+        '<div class="legend-row"><span class="legend-swatch" style="background:#9333ea;"></span>Both present — shade = % encroached</div>';
+      return div;
+    }});
+  map.addControl(new Legend());
+
+  const Title = L.Control.extend({ options:{position:'topleft'},
+    onAdd: function(){
+      const div = L.DomUtil.create('div','info-box');
+      div.innerHTML = '<div style="font-weight:bold;">Tamil Nadu — Water Source Density</div>'+
+        '<div style="opacity:.7;">'+recordCount+' records in '+cellCount+' grid cells (1 km² each)</div>';
+      return div;
+    }});
+  map.addControl(new Title());
+}
+</script>
+</body>
+</html>
